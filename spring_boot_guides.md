@@ -1887,6 +1887,106 @@ public class ProductController {
 ```
 
 ---
+```java
+@RestController
+@RequestMapping("/api")
+public class MyController {
+
+    @GetMapping(value = "/data", produces = {"application/json", "application/xml"})
+    public MyResponse getData() {
+        return new MyResponse("Hello", 123);
+    }
+}
+
+@XmlRootElement
+public class MyResponse {
+    private String message;
+    private int code;
+
+    // getters and setters
+}
+```
+## How to Return JSON or XML from a Single Endpoint
+
+Spring Boot supports content negotiation, allowing a single endpoint to return either JSON or XML based on the client's `Accept` header.
+
+### 1. Add Dependencies
+
+For Maven, add these to your `pom.xml`:
+
+```xml
+<!-- JSON (Jackson) is included by default with spring-boot-starter-web -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<!-- XML support -->
+<dependency>
+    <groupId>com.fasterxml.jackson.dataformat</groupId>
+    <artifactId>jackson-dataformat-xml</artifactId>
+</dependency>
+```
+
+### 2. Create a POJO with XML Support
+
+```java
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+
+@JacksonXmlRootElement(localName = "MyResponse")
+public class MyResponse {
+    private String message;
+    private int code;
+
+    public MyResponse() {}
+    public MyResponse(String message, int code) {
+        this.message = message;
+        this.code = code;
+    }
+    public String getMessage() { return message; }
+    public void setMessage(String message) { this.message = message; }
+    public int getCode() { return code; }
+    public void setCode(int code) { this.code = code; }
+}
+```
+
+### 3. Create the Controller
+
+```java
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class MyController {
+    @GetMapping(value = "/api/data", produces = {"application/json", "application/xml"})
+    public MyResponse getData() {
+        return new MyResponse("Hello", 123);
+    }
+}
+```
+
+### 4. How It Works
+- If the client sends `Accept: application/json`, the response is JSON.
+- If the client sends `Accept: application/xml`, the response is XML.
+
+Spring Boot automatically handles conversion if dependencies are present.
+
+### 5. Example Requests
+
+**JSON:**
+```bash
+curl -H "Accept: application/json" http://localhost:8080/api/data
+```
+**XML:**
+```bash
+curl -H "Accept: application/xml" http://localhost:8080/api/data
+```
+
+### 6. Notes
+- For XML, you can also use `@XmlRootElement` if you prefer JAXB.
+- Make sure your POJO has getters/setters and a no-args constructor.
+- This approach works for POST, PUT, etc. as well.
+
+---
 
 ## Best Practices
 
@@ -1983,3 +2083,740 @@ Remember to always:
 - Keep learning and experimenting
 
 Happy coding with Spring Boot! 🚀
+
+---
+
+## Docker and Kubernetes Guide for Spring Boot
+
+### Docker Setup
+
+#### 1. Creating a Dockerfile
+
+```dockerfile
+# Multi-stage build for optimized image size
+FROM openjdk:17-jdk-slim as build
+
+WORKDIR /workspace/app
+
+# Copy Maven wrapper and pom.xml
+COPY mvnw .
+COPY .mvn .mvn
+COPY pom.xml .
+
+# Download dependencies (cached layer)
+RUN ./mvnw dependency:go-offline
+
+# Copy source code
+COPY src src
+
+# Build the application
+RUN ./mvnw clean package -DskipTests
+
+# Runtime stage
+FROM openjdk:17-jre-slim
+
+# Create non-root user for security
+RUN addgroup --system spring && adduser --system spring --ingroup spring
+USER spring:spring
+
+# Set working directory
+WORKDIR /app
+
+# Copy jar from build stage
+COPY --from=build /workspace/app/target/*.jar app.jar
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/actuator/health || exit 1
+
+# Run the application
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+#### 2. Docker Compose for Development
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: springboot-app
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - DB_HOST=postgres
+      - DB_USERNAME=springuser
+      - DB_PASSWORD=springpass
+      - REDIS_HOST=redis
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - app-network
+    volumes:
+      - ./logs:/app/logs
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: springboot-postgres
+    environment:
+      POSTGRES_DB: springbootdb
+      POSTGRES_USER: springuser
+      POSTGRES_PASSWORD: springpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: springboot-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  nginx:
+    image: nginx:alpine
+    container_name: springboot-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - app
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+#### 3. Docker Profile Configuration
+
+```yaml
+# application-docker.yml
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:springbootdb}
+    username: ${DB_USERNAME:springuser}
+    password: ${DB_PASSWORD:springpass}
+    driver-class-name: org.postgresql.Driver
+  
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+  
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: 6379
+    timeout: 2000ms
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
+
+logging:
+  level:
+    com.example.springboottutorial: INFO
+  file:
+    name: /app/logs/spring-boot-app.log
+  pattern:
+    file: "%d{ISO8601} [%thread] %-5level %logger{36} - %msg%n"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+```
+
+#### 4. Docker Build and Run Commands
+
+```bash
+# Build the image
+docker build -t springboot-app:latest .
+
+# Run single container
+docker run -d \
+  --name springboot-app \
+  -p 8080:8080 \
+  -e SPRING_PROFILES_ACTIVE=docker \
+  springboot-app:latest
+
+# Using Docker Compose
+docker-compose up -d
+
+# View logs
+docker-compose logs -f app
+
+# Scale the application
+docker-compose up -d --scale app=3
+
+# Stop and remove containers
+docker-compose down
+
+# Remove volumes (data will be lost)
+docker-compose down -v
+```
+
+#### 5. Nginx Configuration
+
+```nginx
+# nginx/nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream springboot-app {
+        server app:8080;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://springboot-app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /actuator/health {
+            proxy_pass http://springboot-app/actuator/health;
+            access_log off;
+        }
+    }
+}
+```
+
+### Kubernetes Deployment
+
+#### 1. Namespace Configuration
+
+```yaml
+# k8s/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: springboot-app
+  labels:
+    name: springboot-app
+```
+
+#### 2. ConfigMap and Secrets
+
+```yaml
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: springboot-config
+  namespace: springboot-app
+data:
+  application.yml: |
+    spring:
+      profiles:
+        active: kubernetes
+      datasource:
+        url: jdbc:postgresql://postgres-service:5432/springbootdb
+        username: springuser
+        driver-class-name: org.postgresql.Driver
+      jpa:
+        hibernate:
+          ddl-auto: validate
+        show-sql: false
+      redis:
+        host: redis-service
+        port: 6379
+    logging:
+      level:
+        com.example.springboottutorial: INFO
+    management:
+      endpoints:
+        web:
+          exposure:
+            include: health,info,metrics,prometheus
+
+---
+# k8s/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: springboot-secrets
+  namespace: springboot-app
+type: Opaque
+data:
+  db-password: c3ByaW5ncGFzcw==  # springpass in base64
+  redis-password: ""
+```
+
+#### 3. PostgreSQL Deployment
+
+```yaml
+# k8s/postgres.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: springboot-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: springbootdb
+        - name: POSTGRES_USER
+          value: springuser
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: springboot-secrets
+              key: db-password
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: springboot-app
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: springboot-app
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+#### 4. Redis Deployment
+
+```yaml
+# k8s/redis.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: springboot-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "125m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: springboot-app
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP
+```
+
+#### 5. Spring Boot Application Deployment
+
+```yaml
+# k8s/app-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: springboot-app
+  namespace: springboot-app
+  labels:
+    app: springboot-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: springboot-app
+  template:
+    metadata:
+      labels:
+        app: springboot-app
+    spec:
+      containers:
+      - name: springboot-app
+        image: springboot-app:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "kubernetes"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: springboot-secrets
+              key: db-password
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+      volumes:
+      - name: config-volume
+        configMap:
+          name: springboot-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: springboot-service
+  namespace: springboot-app
+spec:
+  selector:
+    app: springboot-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+  type: ClusterIP
+```
+
+#### 6. Ingress Configuration
+
+```yaml
+# k8s/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: springboot-ingress
+  namespace: springboot-app
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - your-domain.com
+    secretName: springboot-tls
+  rules:
+  - host: your-domain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: springboot-service
+            port:
+              number: 80
+```
+
+#### 7. Horizontal Pod Autoscaler
+
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: springboot-hpa
+  namespace: springboot-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: springboot-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+```
+
+#### 8. Service Monitor for Prometheus
+
+```yaml
+# k8s/service-monitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: springboot-metrics
+  namespace: springboot-app
+  labels:
+    app: springboot-app
+spec:
+  selector:
+    matchLabels:
+      app: springboot-app
+  endpoints:
+  - port: http
+    path: /actuator/prometheus
+    interval: 30s
+```
+
+#### 9. Deployment Commands
+
+```bash
+# Create namespace
+kubectl apply -f k8s/namespace.yaml
+
+# Apply configurations
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secrets.yaml
+
+# Deploy database and cache
+kubectl apply -f k8s/postgres.yaml
+kubectl apply -f k8s/redis.yaml
+
+# Wait for dependencies to be ready
+kubectl wait --for=condition=ready pod -l app=postgres -n springboot-app --timeout=300s
+kubectl wait --for=condition=ready pod -l app=redis -n springboot-app --timeout=300s
+
+# Deploy application
+kubectl apply -f k8s/app-deployment.yaml
+
+# Apply ingress and HPA
+kubectl apply -f k8s/ingress.yaml
+kubectl apply -f k8s/hpa.yaml
+
+# Check deployment status
+kubectl get pods -n springboot-app
+kubectl get services -n springboot-app
+kubectl get ingress -n springboot-app
+
+# View logs
+kubectl logs -f deployment/springboot-app -n springboot-app
+
+# Scale manually
+kubectl scale deployment springboot-app --replicas=5 -n springboot-app
+
+# Port forward for testing
+kubectl port-forward service/springboot-service 8080:80 -n springboot-app
+```
+
+#### 10. Health Checks Configuration
+
+Add to your Spring Boot application:
+
+```java
+// Health checks for Kubernetes
+@Component
+public class KubernetesHealthIndicator implements HealthIndicator {
+    
+    @Override
+    public Health health() {
+        // Check application health
+        boolean isHealthy = checkApplicationHealth();
+        
+        if (isHealthy) {
+            return Health.up()
+                    .withDetail("status", "Application is running")
+                    .withDetail("pod", System.getenv("HOSTNAME"))
+                    .build();
+        } else {
+            return Health.down()
+                    .withDetail("status", "Application is not ready")
+                    .build();
+        }
+    }
+    
+    private boolean checkApplicationHealth() {
+        // Implement your health check logic
+        return true;
+    }
+}
+```
+
+```yaml
+# application-kubernetes.yml
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+```
+
+### Best Practices
+
+#### 1. Security
+- Use non-root users in containers
+- Scan images for vulnerabilities
+- Use secrets for sensitive data
+- Implement network policies
+- Use service accounts with minimal permissions
+
+#### 2. Resource Management
+- Set appropriate resource requests and limits
+- Use horizontal pod autoscaling
+- Monitor resource usage
+- Implement pod disruption budgets
+
+#### 3. Monitoring and Logging
+- Use centralized logging (ELK stack)
+- Implement distributed tracing
+- Set up alerts for critical metrics
+- Use health checks effectively
+
+#### 4. CI/CD Integration
+```yaml
+# .github/workflows/deploy.yml
+name: Build and Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    
+    - name: Build with Maven
+      run: mvn clean package -DskipTests
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ secrets.REGISTRY_URL }}/springboot-app:${{ github.sha }} .
+        docker tag ${{ secrets.REGISTRY_URL }}/springboot-app:${{ github.sha }} ${{ secrets.REGISTRY_URL }}/springboot-app:latest
+    
+    - name: Push to registry
+      run: |
+        echo ${{ secrets.REGISTRY_PASSWORD }} | docker login ${{ secrets.REGISTRY_URL }} -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin
+        docker push ${{ secrets.REGISTRY_URL }}/springboot-app:${{ github.sha }}
+        docker push ${{ secrets.REGISTRY_URL }}/springboot-app:latest
+    
+    - name: Deploy to Kubernetes
+      run: |
+        kubectl set image deployment/springboot-app springboot-app=${{ secrets.REGISTRY_URL }}/springboot-app:${{ github.sha }} -n springboot-app
+```
+
+This comprehensive guide covers Docker containerization and Kubernetes orchestration for Spring Boot applications, including best practices for production deployments.
