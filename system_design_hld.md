@@ -1690,6 +1690,306 @@ class RideMatchingService:
             
         # Wait for acceptance (with timeout)
         return wait_for_acceptance(ride_id, timeout=30)
+
+# Complete implementation of wait_for_acceptance
+def wait_for_acceptance(ride_id, timeout=30):
+    """
+    Wait for a driver to accept the ride request
+    Uses polling or WebSocket for real-time updates
+    """
+    start_time = time.time()
+    check_interval = 0.5  # Check every 500ms
+    
+    while time.time() - start_time < timeout:
+        # Check if any driver accepted
+        ride_status = redis.get(f"ride:{ride_id}:status")
+        
+        if ride_status == "ACCEPTED":
+            # Get driver details
+            driver_id = redis.get(f"ride:{ride_id}:driver")
+            driver_info = get_driver_info(driver_id)
+            
+            # Notify other drivers that ride is taken
+            reject_other_drivers(ride_id)
+            
+            return {
+                "status": "ACCEPTED",
+                "ride_id": ride_id,
+                "driver": driver_info,
+                "eta": calculate_eta(driver_info.location, pickup_location)
+            }
+        
+        # Check if all drivers rejected
+        rejected_count = redis.get(f"ride:{ride_id}:rejected_count")
+        if rejected_count and int(rejected_count) >= 3:
+            return {
+                "status": "NO_DRIVERS_AVAILABLE",
+                "ride_id": ride_id,
+                "message": "No drivers available, please try again"
+            }
+        
+        time.sleep(check_interval)
+    
+    # Timeout - no driver accepted
+    cancel_ride_request(ride_id)
+    return {
+        "status": "TIMEOUT",
+        "ride_id": ride_id,
+        "message": "Request timed out, please try again"
+    }
+
+# Driver accepts ride
+def driver_accept_ride(driver_id, ride_id):
+    """Called when driver clicks 'Accept' button"""
+    # Check if ride is still available
+    ride_status = redis.get(f"ride:{ride_id}:status")
+    
+    if ride_status != "PENDING":
+        return {
+            "success": False,
+            "message": "Ride already accepted by another driver"
+        }
+    
+    # Atomic operation to claim the ride
+    result = redis.set(
+        f"ride:{ride_id}:status",
+        "ACCEPTED",
+        nx=True,  # Only set if doesn't exist
+        ex=3600   # 1 hour expiry
+    )
+    
+    if result:
+        # Successfully claimed the ride
+        redis.set(f"ride:{ride_id}:driver", driver_id)
+        redis.set(f"driver:{driver_id}:status", "BUSY")
+        
+        # Get ride details
+        ride_details = get_ride_details(ride_id)
+        
+        # Notify rider
+        notify_rider(ride_details.rider_id, {
+            "event": "DRIVER_ASSIGNED",
+            "ride_id": ride_id,
+            "driver": get_driver_info(driver_id)
+        })
+        
+        # Start tracking
+        start_ride_tracking(ride_id, driver_id)
+        
+        return {
+            "success": True,
+            "ride": ride_details
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Ride already accepted by another driver"
+        }
+
+# Driver rejects ride
+def driver_reject_ride(driver_id, ride_id):
+    """Called when driver clicks 'Reject' button or times out"""
+    # Increment rejection counter
+    rejected_count = redis.incr(f"ride:{ride_id}:rejected_count")
+    
+    # Log rejection
+    redis.sadd(f"ride:{ride_id}:rejected_by", driver_id)
+    
+    return {"success": True, "rejected_count": rejected_count}
+
+# Cancel pending ride requests
+def cancel_ride_request(ride_id):
+    """Cancel ride and clean up"""
+    redis.set(f"ride:{ride_id}:status", "CANCELLED")
+    
+    # Notify all pending drivers
+    reject_other_drivers(ride_id)
+    
+    # Clean up
+    redis.delete(f"ride:{ride_id}:rejected_count")
+    redis.delete(f"ride:{ride_id}:rejected_by")
+
+# Notify other drivers that ride is taken
+def reject_other_drivers(ride_id):
+    """Notify drivers that the ride is no longer available"""
+    # Get list of drivers who were sent the request
+    driver_ids = redis.smembers(f"ride:{ride_id}:notified_drivers")
+    
+    for driver_id in driver_ids:
+        notification_service.send(driver_id, {
+            "event": "RIDE_NO_LONGER_AVAILABLE",
+            "ride_id": ride_id
+        })
+
+# Real-time ride tracking
+def start_ride_tracking(ride_id, driver_id):
+    """Track driver location in real-time"""
+    redis.set(f"ride:{ride_id}:tracking", "ACTIVE")
+    
+    # Subscribe to driver location updates
+    pubsub = redis.pubsub()
+    pubsub.subscribe(f"driver:{driver_id}:location")
+    
+    # Forward location updates to rider
+    for message in pubsub.listen():
+        if message["type"] == "message":
+            location = json.loads(message["data"])
+            
+            # Update ride tracking
+            redis.geoadd(
+                f"ride:{ride_id}:driver_location",
+                location["longitude"],
+                location["latitude"],
+                driver_id
+            )
+            
+            # Notify rider via WebSocket
+            notify_rider_location_update(ride_id, location)
+            
+            # Check if driver reached pickup
+            distance = calculate_distance(
+                location,
+                get_pickup_location( ride_id)
+            )
+            
+            if distance < 0.05:  # 50 meters
+                notify_rider(get_rider_id(ride_id), {
+                    "event": "DRIVER_ARRIVED",
+                    "ride_id": ride_id
+                })
+
+# WebSocket notification to rider
+def notify_rider_location_update(ride_id, driver_location):
+    """Send real-time driver location to rider"""
+    rider_id = get_rider_id(ride_id)
+    rider_connection = websocket_manager.get_connection(rider_id)
+    
+    if rider_connection:
+        rider_connection.send_json({
+            "event": "DRIVER_LOCATION_UPDATE",
+            "ride_id": ride_id,
+            "location": driver_location,
+            "timestamp": time.time()
+        })
+
+# Complete flow example
+class UberRideLifecycle:
+    def __init__(self):
+        self.matching_service = RideMatchingService()
+        self.location_service = LocationService()
+        self.pricing_service = PricingService()
+    
+    def request_ride(self, rider_id, pickup, destination):
+        """Complete ride request flow"""
+        # Step 1: Create ride request
+        ride_id = generate_ride_id()
+        estimated_price = self.pricing_service.calculate(pickup, destination)
+        
+        # Store ride request
+        ride_data = {
+            "ride_id": ride_id,
+            "rider_id": rider_id,
+            "pickup": pickup,
+            "destination": destination,
+            "status": "PENDING",
+            "estimated_price": estimated_price,
+            "created_at": time.time()
+        }
+        redis.hmset(f"ride:{ride_id}", ride_data)
+        
+        # Step 2: Find nearby drivers
+        drivers = self.matching_service.find_drivers(pickup)
+        
+        if not drivers:
+            return {
+                "success": False,
+                "message": "No drivers available in your area"
+            }
+        
+        # Step 3: Send requests to top 3 drivers
+        notified_drivers = []
+        for driver in drivers[:3]:
+            notification_service.send_ride_request(
+                driver["driver_id"],
+                {
+                    "ride_id": ride_id,
+                    "pickup": pickup,
+                    "destination": destination,
+                    "estimated_price": estimated_price,
+                    "rider_rating": get_rider_rating(rider_id)
+                }
+            )
+            notified_drivers.append(driver["driver_id"])
+        
+        # Track which drivers were notified
+        redis.sadd(f"ride:{ride_id}:notified_drivers", *notified_drivers)
+        
+        # Step 4: Wait for acceptance
+        result = wait_for_acceptance(ride_id, timeout=30)
+        
+        if result["status"] == "ACCEPTED":
+            # Step 5: Start ride tracking
+            start_ride_tracking(ride_id, result["driver"]["id"])
+        
+        return result
+    
+    def start_trip(self, ride_id):
+        """Driver starts the trip"""
+        redis.hset(f"ride:{ride_id}", "status", "IN_PROGRESS")
+        redis.hset(f"ride:{ride_id}", "started_at", time.time())
+        
+        # Notify rider
+        notify_rider(get_rider_id(ride_id), {
+            "event": "TRIP_STARTED",
+            "ride_id": ride_id
+        })
+    
+    def complete_trip(self, ride_id, final_location):
+        """Driver completes the trip"""
+        # Calculate final price
+        ride_data = redis.hgetall(f"ride:{ride_id}")
+        started_at = float(ride_data["started_at"])
+        duration = time.time() - started_at
+        
+        # Get actual distance traveled
+        distance = self.location_service.calculate_trip_distance(ride_id)
+        
+        # Calculate final price
+        final_price = self.pricing_service.calculate_final_price(
+            distance=distance,
+            duration=duration,
+            base_price=float(ride_data["estimated_price"])
+        )
+        
+        # Update ride
+        redis.hmset(f"ride:{ride_id}", {
+            "status": "COMPLETED",
+            "completed_at": time.time(),
+            "final_price": final_price,
+            "distance": distance,
+            "duration": duration
+        })
+        
+        # Process payment
+        payment_result = payment_service.charge(
+            rider_id=ride_data["rider_id"],
+            amount=final_price,
+            ride_id=ride_id
+        )
+        
+        # Update driver status
+        driver_id = ride_data["driver_id"]
+        redis.set(f"driver:{driver_id}:status", "AVAILABLE")
+        
+        # Notify both parties
+        notify_ride_completion(ride_id, final_price)
+        
+        return {
+            "success": True,
+            "final_price": final_price,
+            "distance": distance,
+            "duration": duration
+        }
 ```
 
 ### 3. Netflix Streaming Service
